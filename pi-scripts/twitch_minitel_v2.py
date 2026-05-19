@@ -139,7 +139,7 @@ def twitch_listener(ser, args) -> None:
             sock = irc_connect(args.token, args.nick, args.channel)
             with conn_lock:
                 _socket = sock
-            print_message(ser, f'* connecte  {now_hhmm()}')
+            print_message(ser, '3615 TV STORE')
             buf = ''
             while True:
                 data = sock.recv(4096).decode('utf-8', errors='ignore')
