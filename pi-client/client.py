@@ -161,7 +161,7 @@ async def authenticate(mt: Minitel) -> tuple:
         mt.send_text("  > ")
 
         username = (await asyncio.to_thread(mt.read_input)).strip().lower()
-        if not username or username in ("/older", "/rooms", "/who"):
+        if not username or username in ("/older", "/rooms", "/who", "/clear", "/quit"):
             continue
 
         exists_data = await asyncio.to_thread(
@@ -242,6 +242,8 @@ async def pick_room(mt: Minitel, last_room: str = "") -> str:
 
     raw = (await asyncio.to_thread(mt.read_input)).strip()
 
+    if raw == "/clear":
+        return await pick_room(mt, last_room=last_room)  # redraw
     if raw in ("", "/older") and last_room:
         return last_room
     if raw.isdigit():
@@ -331,6 +333,14 @@ async def outgoing_from_minitel(ws, mt: Minitel, state: dict):
 
         if line.lower() == "/who":
             await ws.send(json.dumps({"type": "who"}))
+            continue
+
+        if line.lower() == "/clear":
+            state["msg_row"] = 3
+            async with _write_lock:
+                await mt.async_clear_screen()
+                await asyncio.sleep(0.2)
+                await _draw_header(mt, state["room"], state["username"])
             continue
 
         if line.lower().startswith("/join "):

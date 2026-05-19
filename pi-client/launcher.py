@@ -246,7 +246,10 @@ def pick(mt):
         raw = mt.read_input().strip()
         if raw in ("1", "2", "3"):
             return int(raw) - 1
-        mt.send_text("  > ")
+        if raw == "/clear":
+            show_menu(mt)  # redraw on RÉPÉTITION
+        else:
+            mt.send_text("  > ")
 
 
 def run_app(mt, idx):

@@ -106,6 +106,8 @@ class Minitel:
                     return "/who"
                 if code[0] == KEY_ANNULATION:
                     return "/quit"
+                if code[0] == KEY_REPETITION:
+                    return "/clear"
                 continue
 
             if byte == 0x0D:

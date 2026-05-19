@@ -114,7 +114,7 @@ class MinitelSearch:
     # ── UI helpers ──────────────────────────────────────────────────────────
 
     def _search_bar(self):
-        prompt = f"MOT: {self._input}"
+        prompt = f"- ecris ici: {self._input}"
         if len(prompt) < COLS - 1:
             prompt += '_'
         self._write_row(24, prompt)
@@ -230,7 +230,7 @@ class MinitelSearch:
 
         self._clear()
         self._write_row(1, "CALLIGRAMMES".center(COLS))
-        self._status("TAPEZ UN MOT  ENVOI POUR CHERCHER")
+        self._status("- ecris ici puis ENVOI pour chercher")
         self._search_bar()
 
         while not self._stop.is_set():
@@ -283,6 +283,7 @@ def main():
     try:
         ser = serial.Serial(args.port, args.baud, timeout=1)
         time.sleep(2)
+        ser.reset_input_buffer()   # discard Arduino boot messages
         print(f"[search] connected on {args.port}")
     except Exception as e:
         print(f"Serial error: {e}"); sys.exit(1)
