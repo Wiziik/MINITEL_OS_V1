@@ -149,7 +149,8 @@ def run_game(ser, state) -> int:
     score   = 0
     speed   = 0.40
 
-    food = free_food(snake)
+    food    = free_food(snake)
+    last_ka = time.time()
     cls(ser)
     draw_field(ser, snake, food, score)
 
@@ -195,12 +196,16 @@ def run_game(ser, state) -> int:
 
         send(ser, bytes(buf))
 
-        # Keep polling input during the remaining tick time
+        # Keep polling input during the remaining tick time + keepalive
         deadline = t0 + speed
         while time.time() < deadline:
             poll(ser, state)
             if state['quit']:
                 return score
+            if time.time() - last_ka >= 30:
+                ser.write(b'\x11')
+                ser.flush()
+                last_ka = time.time()
             time.sleep(0.03)
 
     return score
