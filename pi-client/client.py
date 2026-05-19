@@ -139,13 +139,18 @@ async def _print_msg(mt: Minitel, text: str, state: dict) -> None:
 # ── keepalive ──
 
 async def _keepalive_task(mt: Minitel) -> None:
-    while True:
-        await asyncio.sleep(30)
-        async with _write_lock:
-            try:
-                await mt.async_send_raw(b"\x11")
-            except Exception:
-                pass
+    try:
+        while True:
+            await asyncio.sleep(30)
+            async with _write_lock:
+                try:
+                    await mt.async_send_raw(b"\x11")
+                except Exception as e:
+                    log.warning("Keepalive send failed: %s", e)
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        log.error("Keepalive task crashed: %s", e)
 
 
 # ── auth (sync MT calls — sequential, acceptable blocking) ──
@@ -277,7 +282,7 @@ async def incoming_to_minitel(ws, mt: Minitel, state: dict):
                 await _print_msg(mt, "--- RETOUR: plus ancien ---", state)
             elif msg_type == "history":
                 ts = float(data.get("ts", 0))
-                if ts < state.get("oldest_history_ts", float("inf")):
+                if state["oldest_history_ts"] is None or ts < state["oldest_history_ts"]:
                     state["oldest_history_ts"] = ts
                 user = str(data.get("user", "???"))[:12]
                 msg  = str(data.get("message", ""))
@@ -324,7 +329,7 @@ async def outgoing_from_minitel(ws, mt: Minitel, state: dict):
 
         if line.lower() == "/older":
             before = state.get("oldest_history_ts")
-            if before is None or before == float("inf"):
+            if before is None:
                 async with _write_lock:
                     await _print_msg(mt, "  Pas encore d'historique.", state)
                 continue
@@ -348,7 +353,7 @@ async def outgoing_from_minitel(ws, mt: Minitel, state: dict):
             if new_room:
                 await ws.send(json.dumps({"type": "join", "room": new_room}))
                 state["room"] = new_room
-                state["oldest_history_ts"] = float("inf")
+                state["oldest_history_ts"] = None
                 state["msg_row"] = 3
                 async with _write_lock:
                     await _draw_header(mt, new_room, state["username"])
@@ -384,7 +389,7 @@ async def run():
             "token": token,
             "username": username,
             "auth_error": False,
-            "oldest_history_ts": float("inf"),
+            "oldest_history_ts": None,
             "msg_row": 3,
         }
 
@@ -398,6 +403,7 @@ async def run():
 
         while not state.get("auth_error"):
             try:
+                state["oldest_history_ts"] = None  # reset on each reconnect
                 async with websockets.connect(SERVER_URL, ping_interval=30) as ws:
                     await ws.send(json.dumps({
                         "type": "join",

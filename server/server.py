@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import logging
@@ -15,12 +16,26 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("minitelnet")
 
+_start_time = time.time()
+
 DB_PATH = Path(__file__).parent / "minitelnet.db"
-TOKENS: Dict[str, str] = {}
+TOKENS: Dict[str, tuple] = {}
+TOKEN_TTL = 86400
 _login_failures: Dict[str, list] = {}
 _msg_times: Dict[str, deque] = defaultdict(lambda: deque(maxlen=10))
 
 db: aiosqlite.Connection | None = None
+
+
+def _validate_token(token: str) -> str | None:
+    entry = TOKENS.get(token)
+    if not entry:
+        return None
+    username, created_at = entry
+    if time.time() - created_at > TOKEN_TTL:
+        del TOKENS[token]
+        return None
+    return username
 
 
 # ---------- db helpers ----------
@@ -126,6 +141,15 @@ async def lifespan(app: FastAPI):
     db = await aiosqlite.connect(DB_PATH)
     await _db_init()
     await _migrate_accounts_json()
+    async def _cleanup_loop():
+        while True:
+            await asyncio.sleep(300)
+            now = time.time()
+            for u in list(_login_failures.keys()):
+                _login_failures[u] = [t for t in _login_failures[u] if now - t < 30]
+                if not _login_failures[u]:
+                    del _login_failures[u]
+    asyncio.create_task(_cleanup_loop())
     yield
     await db.close()
 
@@ -165,7 +189,7 @@ async def auth_login(body: AuthBody):
         raise HTTPException(status_code=401, detail="Mot de passe incorrect")
     _clear_login_failures(user)
     token = secrets.token_hex(32)
-    TOKENS[token] = user
+    TOKENS[token] = (user, time.time())
     return {"ok": True, "token": token, "username": user, "last_room": row[1] or ""}
 
 
@@ -174,8 +198,8 @@ async def auth_register(body: AuthBody):
     user = body.username.strip().lower()[:20]
     if not user or not all(c.isalnum() or c in "-_" for c in user):
         raise HTTPException(status_code=400, detail="Nom invalide (lettres, chiffres, - _)")
-    if len(body.password) < 3:
-        raise HTTPException(status_code=400, detail="Mot de passe trop court (min 3)")
+    if len(body.password) < 8:
+        raise HTTPException(status_code=400, detail="Mot de passe trop court (min 8)")
     try:
         await db.execute(
             "INSERT INTO users (username, password_hash, last_room) VALUES (?,?,?)",
@@ -185,7 +209,7 @@ async def auth_register(body: AuthBody):
     except aiosqlite.IntegrityError:
         raise HTTPException(status_code=409, detail="Nom deja pris")
     token = secrets.token_hex(32)
-    TOKENS[token] = user
+    TOKENS[token] = (user, time.time())
     log.info("New account: %s", user)
     return {"ok": True, "token": token, "username": user, "last_room": ""}
 
@@ -254,6 +278,19 @@ async def get_rooms():
     return manager.list_rooms()
 
 
+@app.get("/health")
+async def health():
+    async with db.execute("SELECT COUNT(*) FROM users") as cur:
+        user_count = (await cur.fetchone())[0]
+    return {
+        "status": "ok",
+        "users": user_count,
+        "rooms": manager.list_rooms(),
+        "active_tokens": len(TOKENS),
+        "uptime": round(time.time() - _start_time),
+    }
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
@@ -264,12 +301,12 @@ async def ws_endpoint(ws: WebSocket):
         data = json.loads(raw)
 
         token = str(data.get("token", ""))
-        if token not in TOKENS:
+        user = _validate_token(token)
+        if not user:
             await ws.send_json({"type": "error", "message": "Non autorise"})
             await ws.close()
             return
 
-        user = TOKENS[token]
         room = _clean_room(data.get("room", "general")) or "general"
 
         manager.join(ws, room, user)

@@ -104,6 +104,7 @@ class MinitelSearch:
         with self._lock:
             self.ser.write(bytes([0x1F, 0x40 + row, 0x40 + 1]))
             self.ser.write(line.encode('ascii'))
+            self.ser.flush()
         time.sleep(len(line) / 120 + 0.02)
 
     def _clear(self):
@@ -227,6 +228,15 @@ class MinitelSearch:
     def run(self):
         threading.Thread(target=self._keepalive_loop, daemon=True).start()
         threading.Thread(target=self._display_loop,   daemon=True).start()
+
+        import glob as _glob
+        if not _glob.glob(os.path.join(self.folder, '*.txt')):
+            self._clear()
+            self._write_row(11, 'ERREUR: dossier introuvable ou vide')
+            self._write_row(12, self.folder[:COLS])
+            self._write_row(13, 'Verifiez le chemin --folder')
+            time.sleep(5)
+            return
 
         self._clear()
         self._write_row(1, "CALLIGRAMMES".center(COLS))

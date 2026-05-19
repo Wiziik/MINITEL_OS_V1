@@ -24,7 +24,7 @@ BAUD_RATE     = 9600
 TWITCH_SERVER = 'irc.chat.twitch.tv'
 TWITCH_PORT   = 6697                          # TLS
 TWITCH_NICK   = os.environ.get('TWITCH_NICK',    'tv_store')
-TWITCH_TOKEN  = os.environ.get('TWITCH_TOKEN',   'oauth:3ow26fwjkixbhs0nurhfgw68p2wfjz')
+TWITCH_TOKEN  = os.environ.get('TWITCH_TOKEN', '')   # set TWITCH_TOKEN env var — never hardcode
 TWITCH_CHAN   = os.environ.get('TWITCH_CHANNEL', '#tv_store')
 
 COLS      = 40
@@ -110,11 +110,18 @@ def irc_connect(token: str, nick: str, channel: str) -> socket.socket:
     raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     raw.settimeout(60)
     raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    ctx  = ssl.create_default_context()
-    sock = ctx.wrap_socket(raw, server_hostname=TWITCH_SERVER)
-    sock.connect((TWITCH_SERVER, TWITCH_PORT))
-    sock.sendall(f'PASS {token}\r\nNICK {nick}\r\nJOIN {channel}\r\n'.encode())
-    return sock
+    try:
+        ctx  = ssl.create_default_context()
+        sock = ctx.wrap_socket(raw, server_hostname=TWITCH_SERVER)
+        sock.connect((TWITCH_SERVER, TWITCH_PORT))
+        sock.sendall(f'PASS {token}\r\nNICK {nick}\r\nJOIN {channel}\r\n'.encode())
+        return sock
+    except Exception:
+        try:
+            raw.close()
+        except Exception:
+            pass
+        raise
 
 
 def handle_irc_line(ser, sock, line: str, channel: str) -> None:
@@ -251,8 +258,8 @@ def main() -> None:
     ap.add_argument('--token',   default=TWITCH_TOKEN)
     args = ap.parse_args()
 
-    if not args.token or args.token == 'oauth:':
-        print('ERROR: set TWITCH_TOKEN env var or use --token oauth:...')
+    if not args.token or not args.token.startswith('oauth:'):
+        print('ERROR: set TWITCH_TOKEN env var (must start with oauth:)')
         sys.exit(1)
 
     args.channel = args.channel if args.channel.startswith('#') else f'#{args.channel}'

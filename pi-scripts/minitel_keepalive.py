@@ -1,3 +1,4 @@
+import random
 import threading
 import time
 
@@ -13,9 +14,12 @@ class MinitelKeepAlive:
             try:
                 # 0x11 (DC1) = Minitel "cursor/screen on" — resets the screen-sleep timer
                 self.ser.write(b'\x11')
+                self.ser.flush()
             except Exception as e:
-                print(f"[KEEPALIVE ERROR] {e}")
-            time.sleep(self.interval)
+                import sys
+                print(f"[KEEPALIVE ERROR] {e}", file=sys.stderr)
+            jitter = random.randint(-5, 5)
+            time.sleep(max(10, self.interval + jitter))
 
     def start(self):
         if self.running:

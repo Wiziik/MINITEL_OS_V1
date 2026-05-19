@@ -76,7 +76,7 @@ def _run(cmd, timeout=15):
 
 
 def _is_connected():
-    ok, _ = _run(['ping', '-c', '1', '-W', '2', '8.8.8.8'], timeout=5)
+    ok, _ = _run(['ping', '-c', '2', '-W', '2', '8.8.8.8'], timeout=8)
     return ok
 
 
@@ -263,7 +263,8 @@ def run_app(mt, idx):
     mt.clear_screen()
     mt.send_line(f"  Lancement: {app['label']}")
     mt.send_line("")
-    _ka_ref[0] = None          # pause keepalive while child owns the port
+    with _ka_lock:
+        _ka_ref[0] = None          # pause keepalive while child owns the port
     mt.close()
     time.sleep(0.5)
     try:
@@ -275,13 +276,15 @@ def run_app(mt, idx):
 
 # Shared reference so the keepalive thread can always reach the live serial port.
 # Set to None while a child app owns the port.
+_ka_lock = threading.Lock()
 _ka_ref = [None]
 
 
 def _keepalive_thread():
     while True:
         time.sleep(30)
-        mt = _ka_ref[0]
+        with _ka_lock:
+            mt = _ka_ref[0]
         if mt is not None:
             try:
                 mt.ser.write(b'\x11')
@@ -294,7 +297,8 @@ def main():
     threading.Thread(target=_keepalive_thread, daemon=True).start()
 
     mt = Minitel(port=PORT)
-    _ka_ref[0] = mt
+    with _ka_lock:
+        _ka_ref[0] = mt
     time.sleep(2.5)
     mt.ser.reset_input_buffer()
 
@@ -305,7 +309,8 @@ def main():
         idx = pick(mt)
         run_app(mt, idx)
         mt = Minitel(port=PORT)
-        _ka_ref[0] = mt        # re-enable keepalive for the menu period
+        with _ka_lock:
+            _ka_ref[0] = mt        # re-enable keepalive for the menu period
         time.sleep(2.5)
         mt.ser.reset_input_buffer()
 

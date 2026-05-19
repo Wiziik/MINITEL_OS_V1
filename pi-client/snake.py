@@ -59,12 +59,14 @@ def cls(ser) -> None:
 
 # ── input (single-threaded, non-blocking) ──────────────────────────────────
 
-def poll(ser, state: dict) -> None:
-    """Drain all pending bytes from the serial buffer and update state."""
-    while ser.in_waiting > 0:
+def poll(ser, state: dict, max_bytes: int = 64) -> None:
+    """Drain up to max_bytes from the serial buffer and update state."""
+    read = 0
+    while read < max_bytes and ser.in_waiting > 0:
         b = ser.read(1)
         if not b:
             break
+        read += 1
         c = b[0] & 0x7F
 
         if state.get('_fn'):
@@ -225,6 +227,7 @@ def main():
     state = {'dir': RIGHT, 'quit': False, 'envoi': False, '_fn': False}
 
     while True:
+        state.update({'dir': RIGHT, 'quit': False, 'envoi': False, '_fn': False})
         draw_start(ser)
         wait_for_envoi(ser, state)
         if state['quit']:
