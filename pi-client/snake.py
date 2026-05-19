@@ -54,8 +54,8 @@ def draw_start(ser) -> None:
     cls(ser)
     b = bytearray()
     b += cur(6,  14) + b'* SNAKE *'
-    b += cur(9,  8)  + b'Z = haut    S = bas'
-    b += cur(10, 8)  + b'Q = gauche  D = droite'
+    b += cur(9,  6)  + b'Z ou 8 = haut    S ou 2 = bas'
+    b += cur(10, 6)  + b'Q ou 4 = gauche  D ou 6 = droite'
     b += cur(12, 6)  + b'ENVOI pour commencer'
     b += cur(13, 6)  + b'ANNULATION pour quitter'
     send(ser, bytes(b))
@@ -70,7 +70,7 @@ def draw_field(ser, snake, food, score) -> None:
     b += cur(TOP_ROW, 1) + ('+' + '-' * 38 + '+').encode('ascii')
     b += cur(BOT_ROW, 1) + ('+' + '-' * 38 + '+').encode('ascii')
     # help
-    b += cur(HELP_ROW, 1) + b'Z S Q D = direction    ANNUL = quitter'
+    b += cur(HELP_ROW, 1) + b'Z/8 S/2 Q/4 D/6   ANNUL = quitter'
     # snake
     for i, (r, c) in enumerate(snake):
         b += cur(FIELD_TOP + r, 1 + c)
@@ -175,11 +175,14 @@ def kb_thread(ser, state):
                 if   c == FN_ENVOI:      state['envoi'] = True
                 elif c == FN_ANNULATION: state['quit']  = True
                 continue
-            if   c == 0x13:     expect_fn    = True
-            elif c == ord('z'): state['dir'] = UP
-            elif c == ord('s'): state['dir'] = DOWN
-            elif c == ord('q'): state['dir'] = LEFT
-            elif c == ord('d'): state['dir'] = RIGHT
+            if c == 0x13:
+                expect_fn = True
+            elif 0x20 <= c <= 0x7E:
+                key = chr(c).upper()
+                if   key in ('Z', '8'): state['dir'] = UP
+                elif key in ('S', '2'): state['dir'] = DOWN
+                elif key in ('Q', '4'): state['dir'] = LEFT
+                elif key in ('D', '6'): state['dir'] = RIGHT
         except Exception:
             time.sleep(0.1)
 
