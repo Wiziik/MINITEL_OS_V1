@@ -75,6 +75,31 @@ Boot menu showing the **3615 TV STORE** pixel-art splash. User picks:
 
 When the chosen app exits (or `/quit` is used), the menu reappears.
 
+### WiFi setup at boot
+
+If no internet is detected on startup, the launcher shows a WiFi picker before the menu:
+
+```
+WIFI
+----------------------------------------
+
+ *1. MyNetwork_5G        #### WPA
+  2. Livebox-ABCD        ###  WPA
+  3. FreeWifi            ##   --
+
+  0. Ignorer (pas de WiFi)
+
+  Numero + ENVOI:
+  > 
+```
+
+- Waits 10s for NetworkManager to auto-connect first
+- Lists up to 7 networks sorted by signal strength (`*` = currently active)
+- `####` = signal bars (75 / 50 / 25 / weak)
+- Password entry masked with `*`
+- `0` skips to the menu in offline mode
+- Uses `nmcli` — requires NetworkManager on the Pi
+
 ---
 
 ## Pi Client — MinitelNet chat
