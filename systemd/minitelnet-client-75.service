@@ -8,7 +8,7 @@ WorkingDirectory=/home/pi/minitelnet/pi-client
 Environment=MINITELNET_URL=ws://192.168.1.76:8000/ws
 Environment=MINITEL_PORT=/dev/ttyACM0
 Environment=MINITELNET_USER=minitel-75
-ExecStart=/home/pi/minitelnet/pi-client/.venv/bin/python client.py
+ExecStart=/home/pi/minitelnet/pi-client/.venv/bin/python /home/pi/minitelnet/pi-client/launcher_75.py
 Restart=always
 RestartSec=5
 
