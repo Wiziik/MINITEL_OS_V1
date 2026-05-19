@@ -27,6 +27,10 @@ APPS = [
                 "--port", PORT,
                 "--folder", "/home/pi/texts/poetry_corpus"],
     },
+    {
+        "label": "4. Snake",
+        "cmd": [PY, os.path.join(HERE, "snake.py"), "--port", PORT],
+    },
 ]
 
 GLYPHS = {
@@ -237,17 +241,18 @@ def show_menu(mt):
     for app in APPS:
         mt.send_line(f"  {app['label']}")
     mt.send_line("")
-    mt.send_line("  Tapez 1, 2 ou 3 puis ENVOI:")
+    mt.send_line(f"  Tapez 1-{len(APPS)} puis ENVOI:")
     mt.send_text("  > ")
 
 
 def pick(mt):
+    valid = {str(i + 1) for i in range(len(APPS))}
     while True:
         raw = mt.read_input().strip()
-        if raw in ("1", "2", "3"):
+        if raw in valid:
             return int(raw) - 1
         if raw == "/clear":
-            show_menu(mt)  # redraw on RÉPÉTITION
+            show_menu(mt)
         else:
             mt.send_text("  > ")
 
