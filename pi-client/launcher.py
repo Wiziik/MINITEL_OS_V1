@@ -162,7 +162,10 @@ def _signal_bar(signal):
 
 
 def _connect_wifi(ssid, password=None):
-    cmd = ['nmcli', 'dev', 'wifi', 'connect', ssid]
+    # Run via sudo: the launcher runs as `pi` under systemd with no login
+    # session, so polkit denies it NetworkManager control ("Not authorized to
+    # control networking"). `pi` has passwordless sudo, so -n connects as root.
+    cmd = ['sudo', '-n', 'nmcli', 'dev', 'wifi', 'connect', ssid]
     if password:
         cmd += ['password', password]
     return _run(cmd, timeout=30)
