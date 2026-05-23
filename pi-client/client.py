@@ -1,22 +1,21 @@
 import asyncio
 import json
 import logging
-import os
-import socket
-import urllib.error
-import urllib.parse
-import urllib.request
 
 import websockets
 from minitel import Minitel
+import device_config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("pi-client")
 
-SERVER_URL  = os.environ.get("MINITELNET_URL", "ws://localhost:8000/ws")
-HTTP_URL    = SERVER_URL.replace("ws://", "http://").replace("wss://", "https://").rsplit("/ws", 1)[0]
-SERIAL_PORT = os.environ.get("MINITEL_PORT", "/dev/ttyUSB0")
-KEEPALIVE   = os.environ.get("MINITEL_KEEPALIVE", "0") == "1"
+CFG          = device_config.load()
+SERVER_URL   = CFG["server_url"]
+HTTP_URL     = device_config.http_base(SERVER_URL)
+SERIAL_PORT  = CFG["serial_port"]
+KEEPALIVE    = CFG["keepalive"]
+DEVICE_TOKEN = CFG["token"]
+DISPLAY_NAME = CFG["display_name"]
 
 _write_lock = asyncio.Lock()
 
@@ -61,37 +60,16 @@ def _truncate(text: str, width: int = 38) -> str:
     return text if len(text) <= width else text[:width - 1] + "~"
 
 
-# ── http helpers ──
-
-def _http_get(path: str) -> dict:
-    try:
-        with urllib.request.urlopen(HTTP_URL + path, timeout=5) as r:
-            return json.loads(r.read())
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def _http_post(path: str, data: dict) -> dict:
-    body = json.dumps(data).encode()
-    req = urllib.request.Request(
-        HTTP_URL + path, data=body, method="POST",
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            return json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        try:
-            return {"ok": False, "error": json.loads(e.read()).get("detail", str(e))}
-        except Exception:
-            return {"ok": False, "error": str(e)}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
+# ── http helper (rooms list only) ──
 
 def _fetch_rooms() -> dict:
-    result = _http_get("/rooms")
-    return {k: v for k, v in result.items() if k != "error"}
+    import urllib.request
+    try:
+        with urllib.request.urlopen(HTTP_URL + "/rooms", timeout=5) as r:
+            result = json.loads(r.read())
+        return {k: v for k, v in result.items() if k != "error"}
+    except Exception:
+        return {}
 
 
 # ── splash (sync, runs in thread) ──
@@ -106,6 +84,7 @@ def _show_splash(mt: Minitel) -> None:
         mt.send_line(row)
     mt.send_line("")
     mt.send_line("----------------------------------------")
+    mt.send_line("  Connexion...")
 
 
 # ── fixed layout helpers (async, called within _write_lock) ──
@@ -153,111 +132,6 @@ async def _keepalive_task(mt: Minitel) -> None:
         log.error("Keepalive task crashed: %s", e)
 
 
-# ── auth (sync MT calls — sequential, acceptable blocking) ──
-
-async def authenticate(mt: Minitel) -> tuple:
-    """Returns (username, token, last_room).
-    Does NOT clear the screen — the splash logo above stays visible."""
-    while True:
-        mt.send_line("")
-        mt.send_line("  CONNEXION")
-        mt.send_line("")
-        mt.send_line("  Nom d'utilisateur:")
-        mt.send_text("  > ")
-
-        username = (await asyncio.to_thread(mt.read_input)).strip().lower()
-        if not username or username in ("/older", "/rooms", "/who", "/clear", "/quit"):
-            continue
-
-        exists_data = await asyncio.to_thread(
-            _http_get, f"/auth/exists/{urllib.parse.quote(username)}"
-        )
-
-        if exists_data.get("exists"):
-            mt.send_line("")
-            mt.send_line("  Mot de passe:")
-            mt.send_text("  > ")
-            password = await asyncio.to_thread(mt.read_password)
-            result = await asyncio.to_thread(
-                _http_post, "/auth/login", {"username": username, "password": password}
-            )
-            if result.get("ok"):
-                mt.send_line("")
-                mt.send_line(f"  Bonjour {result['username']}!")
-                await asyncio.sleep(1.5)
-                return result["username"], result["token"], result.get("last_room", "")
-            else:
-                mt.send_line("")
-                mt.send_line(f"  * {result.get('error', 'Erreur')}")
-                await asyncio.sleep(2)
-        else:
-            mt.send_line("")
-            mt.send_line(f"  Nouveau compte: {username}")
-            mt.send_line("  Mot de passe:")
-            mt.send_text("  > ")
-            password = await asyncio.to_thread(mt.read_password)
-            if not password:
-                mt.send_line("")
-                mt.send_line("  * Mot de passe vide!")
-                await asyncio.sleep(2)
-                continue
-            mt.send_line("")
-            mt.send_line("  Confirmez:")
-            mt.send_text("  > ")
-            confirm = await asyncio.to_thread(mt.read_password)
-            if password != confirm:
-                mt.send_line("")
-                mt.send_line("  * Mots de passe differents!")
-                await asyncio.sleep(2)
-                continue
-            result = await asyncio.to_thread(
-                _http_post, "/auth/register", {"username": username, "password": password}
-            )
-            if result.get("ok"):
-                mt.send_line("")
-                mt.send_line(f"  Bienvenue {result['username']}!")
-                await asyncio.sleep(1.5)
-                return result["username"], result["token"], result.get("last_room", "")
-            else:
-                mt.send_line("")
-                mt.send_line(f"  * {result.get('error', 'Erreur')}")
-                await asyncio.sleep(2)
-
-
-# ── room picker (sync MT calls) ──
-
-async def pick_room(mt: Minitel, last_room: str = "") -> str:
-    mt.clear_screen()
-    mt.send_line("")
-    if last_room:
-        mt.send_line(f"  Reprendre: #{last_room}")
-        mt.send_line("  (ENVOI vide pour reprendre)")
-        mt.send_line("")
-    rooms = await asyncio.to_thread(_fetch_rooms)
-    room_list = list(rooms.items())
-    if room_list:
-        mt.send_line("  Salles actives:")
-        for i, (name, count) in enumerate(room_list[:6], 1):
-            mt.send_line(f"  {i}. {name} ({count})")
-    else:
-        mt.send_line("  Aucune salle active.")
-    mt.send_line("")
-    mt.send_line("  Nom de la salle puis ENVOI:")
-    mt.send_text("  > ")
-
-    raw = (await asyncio.to_thread(mt.read_input)).strip()
-
-    if raw == "/clear":
-        return await pick_room(mt, last_room=last_room)  # redraw
-    if raw in ("", "/older") and last_room:
-        return last_room
-    if raw.isdigit():
-        idx = int(raw) - 1
-        if 0 <= idx < len(room_list):
-            return room_list[idx][0]
-    return _clean_room(raw) or last_room or "general"
-
-
 # ── chat coroutines ──
 
 async def incoming_to_minitel(ws, mt: Minitel, state: dict):
@@ -271,9 +145,19 @@ async def incoming_to_minitel(ws, mt: Minitel, state: dict):
 
         if msg_type == "error":
             async with _write_lock:
-                await _print_msg(mt, f"* ERREUR: {data.get('message', '')}", state)
+                await _print_msg(mt, f"* {data.get('message', '')}", state)
             state["auth_error"] = True
             return
+
+        if msg_type == "hello":
+            # Server is the source of truth for our handle and resumed room.
+            state["room"] = data.get("room", state["room"]) or "general"
+            state["username"] = data.get("user", state["username"]) or DISPLAY_NAME
+            state["msg_row"] = 3
+            async with _write_lock:
+                await _draw_header(mt, state["room"], state["username"])
+            state["ready"] = True
+            continue
 
         async with _write_lock:
             if msg_type == "history_start":
@@ -301,7 +185,11 @@ async def incoming_to_minitel(ws, mt: Minitel, state: dict):
 
 async def outgoing_from_minitel(ws, mt: Minitel, state: dict):
     while True:
-        # Ensure prompt is visible before blocking on input
+        # Wait for the server hello (header drawn) before showing a prompt.
+        if not state.get("ready"):
+            await asyncio.sleep(0.1)
+            continue
+
         async with _write_lock:
             await mt.async_move_cursor(24, 1)
             await mt.async_clear_to_eol()
@@ -372,6 +260,10 @@ async def outgoing_from_minitel(ws, mt: Minitel, state: dict):
 # ── main loop ──
 
 async def run():
+    if not DEVICE_TOKEN:
+        log.error("No device token configured (%s). Run the enroll tool first.",
+                  device_config.CONFIG_PATH)
+
     mt = Minitel(port=SERIAL_PORT)
     await asyncio.sleep(2.5)
     mt.ser.reset_input_buffer()
@@ -379,56 +271,62 @@ async def run():
     if KEEPALIVE:
         asyncio.create_task(_keepalive_task(mt))
 
+    await asyncio.to_thread(_show_splash, mt)
+
+    state = {
+        "room": "general",
+        "username": DISPLAY_NAME,
+        "auth_error": False,
+        "ready": False,
+        "oldest_history_ts": None,
+        "msg_row": 3,
+    }
+
+    # Double-clear with pause: drain the Arduino pipeline before the cursor-
+    # positioned chat layout draws over the splash.
+    await mt.async_clear_screen()
+    await asyncio.sleep(0.5)
+    await mt.async_clear_screen()
+    await asyncio.sleep(0.2)
+
     while True:
-        # Splash stays on screen during auth — no clear inside authenticate()
-        await asyncio.to_thread(_show_splash, mt)
-        username, token, last_room = await authenticate(mt)
-        room = await pick_room(mt, last_room=last_room)
-        state = {
-            "room": room,
-            "token": token,
-            "username": username,
-            "auth_error": False,
-            "oldest_history_ts": None,
-            "msg_row": 3,
-        }
-
-        # Double-clear with pause: ensures Arduino pipeline is drained before
-        # cursor-positioned chat layout draws over any previous content.
-        await mt.async_clear_screen()
-        await asyncio.sleep(0.5)
-        await mt.async_clear_screen()
-        await asyncio.sleep(0.2)
-        await _draw_header(mt, room, username)
-
-        while not state.get("auth_error"):
+        state["ready"] = False
+        state["oldest_history_ts"] = None
+        try:
+            async with websockets.connect(SERVER_URL, ping_interval=30) as ws:
+                await ws.send(json.dumps({
+                    "type": "join",
+                    "token": DEVICE_TOKEN,
+                    "room": state["room"],
+                }))
+                tasks = [
+                    asyncio.create_task(incoming_to_minitel(ws, mt, state)),
+                    asyncio.create_task(outgoing_from_minitel(ws, mt, state)),
+                ]
+                done, pending = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_COMPLETED
+                )
+                for t in pending:
+                    t.cancel()
+        except (OSError, websockets.exceptions.WebSocketException) as e:
+            log.warning("Connection lost: %s — retrying in 5s", e)
             try:
-                state["oldest_history_ts"] = None  # reset on each reconnect
-                async with websockets.connect(SERVER_URL, ping_interval=30) as ws:
-                    await ws.send(json.dumps({
-                        "type": "join",
-                        "token": token,
-                        "room": state["room"],
-                    }))
-                    tasks = [
-                        asyncio.create_task(incoming_to_minitel(ws, mt, state)),
-                        asyncio.create_task(outgoing_from_minitel(ws, mt, state)),
-                    ]
-                    done, pending = await asyncio.wait(
-                        tasks, return_when=asyncio.FIRST_COMPLETED
-                    )
-                    for t in pending:
-                        t.cancel()
-                    if state.get("auth_error"):
-                        break
-            except (OSError, websockets.exceptions.WebSocketException) as e:
-                log.warning("Connection lost: %s — retrying in 5s", e)
-                try:
-                    async with _write_lock:
-                        await _print_msg(mt, "* deconnecte. Retry 5s...", state)
-                except Exception:
-                    pass
-                await asyncio.sleep(5)
+                async with _write_lock:
+                    await _print_msg(mt, "* deconnecte. Retry 5s...", state)
+            except Exception:
+                pass
+            await asyncio.sleep(5)
+            continue
+
+        if state.get("auth_error"):
+            # Token rejected/revoked — unlikely to fix itself, back off slowly.
+            try:
+                async with _write_lock:
+                    await _print_msg(mt, "* appareil non autorise. Retry 30s.", state)
+            except Exception:
+                pass
+            state["auth_error"] = False
+            await asyncio.sleep(30)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,16 @@
+[Unit]
+Description=MinitelNet WebSocket server
+After=network.target
+
+[Service]
+User=minitel
+WorkingDirectory=/opt/minitelnet/server
+# MINITELNET_ADMIN_SECRET (and any future secrets) live here, not in git:
+#   /etc/minitelnet/server.env   ->   MINITELNET_ADMIN_SECRET=...
+EnvironmentFile=/etc/minitelnet/server.env
+ExecStart=/opt/minitelnet/server/.venv/bin/uvicorn server:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

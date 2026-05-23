@@ -1,14 +1,14 @@
 [Unit]
 Description=MinitelNet client
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 User=pi
 WorkingDirectory=/home/pi/minitelnet/pi-client
-Environment=MINITELNET_URL=ws://192.168.1.76:8000/ws
-Environment=MINITEL_PORT=/dev/ttyUSB0
-Environment=MINITEL_KEEPALIVE=1
-Environment=MINITELNET_USER=minitel-50
+# All per-device config (server URL, token, apps, flags) lives in
+# /etc/minitelnet/device.json — written once at enroll time. This unit is
+# identical on every Pi.
 ExecStart=/home/pi/minitelnet/pi-client/.venv/bin/python /home/pi/minitelnet/pi-client/launcher.py
 Restart=always
 RestartSec=5

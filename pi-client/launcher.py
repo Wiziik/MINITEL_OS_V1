@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""Boot menu for .50 — WiFi setup if needed, then choose which app to launch."""
+"""Single config-driven launcher for every Minitel Pi.
+
+Behaviour is driven entirely by /etc/minitelnet/device.json (see device_config.py);
+the git tree is identical on every box. Replaces the old per-Pi launcher_*.py forks.
+
+Config knobs that matter here:
+  apps          ordered subset of {chat, twitch, coeur, snake}; addons appended
+  show_menu     False -> chat-only kiosk (old .75 behaviour), no app menu
+  show_settings False -> hide the Reglages entry
+  keepalive     send XON every 30s while the launcher owns the port
+  service       systemd unit name used by Reglages > Mise a jour
+"""
 import os
 import subprocess
 import sys
@@ -8,33 +19,53 @@ import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 from minitel import Minitel
+import device_config
 from launcher_settings import settings_menu, enabled_addon_apps
 
-PORT    = os.environ.get("MINITEL_PORT", "/dev/ttyUSB0")
+CFG     = device_config.load()
+PORT    = CFG["serial_port"]
+SERVICE = CFG["service"]
 HERE    = os.path.dirname(os.path.abspath(__file__))
 PY      = sys.executable
-SERVICE = "minitelnet-client.service"
 
-APPS = [
-    {
-        "label": "MinitelNet - Chat",
-        "cmd": [PY, os.path.join(HERE, "client.py")],
-    },
-    {
-        "label": "Twitch TV STORE",
-        "cmd": [PY, "/home/pi/twitch_minitel_v2.py", "--port", PORT],
-    },
-    {
-        "label": "Coeur Poetique",
-        "cmd": [PY, "/home/pi/minitel_heart_search.py",
-                "--port", PORT,
-                "--folder", "/home/pi/texts/poetry_corpus"],
-    },
-    {
-        "label": "Snake",
-        "cmd": [PY, os.path.join(HERE, "snake.py"), "--port", PORT],
-    },
-]
+
+# ── app registry: key -> builder(py, port) -> app dict ──────────────────────
+
+def _app_chat(py, port):
+    return {"label": "MinitelNet - Chat", "cmd": [py, os.path.join(HERE, "client.py")]}
+
+
+def _app_twitch(py, port):
+    return {"label": "Twitch TV STORE",
+            "cmd": [py, "/home/pi/twitch_minitel_v2.py", "--port", port]}
+
+
+def _app_coeur(py, port):
+    return {"label": "Coeur Poetique",
+            "cmd": [py, "/home/pi/minitel_heart_search.py",
+                    "--port", port, "--folder", "/home/pi/texts/poetry_corpus"]}
+
+
+def _app_snake(py, port):
+    return {"label": "Snake", "cmd": [py, os.path.join(HERE, "snake.py"), "--port", port]}
+
+
+APP_REGISTRY = {
+    "chat":   _app_chat,
+    "twitch": _app_twitch,
+    "coeur":  _app_coeur,
+    "snake":  _app_snake,
+}
+
+
+def _configured_apps():
+    apps = []
+    for key in CFG["apps"]:
+        builder = APP_REGISTRY.get(key)
+        if builder:
+            apps.append(builder(PY, PORT))
+    return apps
+
 
 GLYPHS = {
     'T': ["###", " # ", " # ", " # ", " # "],
@@ -67,7 +98,7 @@ def _big_text(text, width=40):
     return [" " * pad + r for r in rows]
 
 
-# ── wifi helpers ───────────────────────────────────────────────────────────
+# ── wifi helpers ────────────────────────────────────────────────────────────
 
 def _run(cmd, timeout=15):
     try:
@@ -143,15 +174,13 @@ def wifi_setup(mt):
     mt.send_line("")
     mt.send_line("  Verification WiFi...")
 
-    # Give NetworkManager up to 10s to auto-connect
-    for _ in range(5):
+    for _ in range(5):                       # give NetworkManager up to 10s
         time.sleep(2)
         if _is_connected():
             mt.send_line("  WiFi OK!")
             time.sleep(1)
             return
 
-    # No connection — show the picker
     while True:
         mt.clear_screen()
         mt.send_line("  Scan des reseaux...")
@@ -228,13 +257,33 @@ def wifi_setup(mt):
             mt.read_input()
 
 
-# ── main menu ─────────────────────────────────────────────────────────────
+# ── keepalive (daemon thread; paused while a child app owns the port) ────────
+
+_ka_lock = threading.Lock()
+_ka_ref = [None]          # live Minitel, or None while a child owns the port
+
+
+def _keepalive_thread():
+    while True:
+        time.sleep(30)
+        with _ka_lock:
+            mt = _ka_ref[0]
+        if mt is not None:
+            try:
+                mt.ser.write(b'\x11')
+                mt.ser.flush()
+            except Exception:
+                pass
+
+
+# ── menu ─────────────────────────────────────────────────────────────────────
 
 def _menu_entries():
     """Recompute each render so newly-enabled addons appear immediately."""
-    entries = [(a["label"], "app", a) for a in APPS]
+    entries = [(a["label"], "app", a) for a in _configured_apps()]
     entries += [(a["label"], "app", a) for a in enabled_addon_apps(PY, PORT)]
-    entries.append(("Reglages", "settings", None))
+    if CFG["show_settings"]:
+        entries.append(("Reglages", "settings", None))
     return entries
 
 
@@ -268,12 +317,13 @@ def pick(mt, entries):
             mt.send_text("  > ")
 
 
-def run_app(mt, idx, app):
+def run_app(mt, app):
+    """Hand the serial port to a child app: pause keepalive, close, spawn, return."""
     mt.clear_screen()
     mt.send_line(f"  Lancement: {app['label']}")
     mt.send_line("")
     with _ka_lock:
-        _ka_ref[0] = None          # pause keepalive while child owns the port
+        _ka_ref[0] = None          # a child owns the port now
     mt.close()
     time.sleep(0.5)
     try:
@@ -283,36 +333,35 @@ def run_app(mt, idx, app):
     time.sleep(1)
 
 
-# Shared reference so the keepalive thread can always reach the live serial port.
-# Set to None while a child app owns the port.
-_ka_lock = threading.Lock()
-_ka_ref = [None]
-
-
-def _keepalive_thread():
-    while True:
-        time.sleep(30)
-        with _ka_lock:
-            mt = _ka_ref[0]
-        if mt is not None:
-            try:
-                mt.ser.write(b'\x11')
-                mt.ser.flush()
-            except Exception:
-                pass
+def _reopen():
+    mt = Minitel(port=PORT)
+    with _ka_lock:
+        _ka_ref[0] = mt if CFG["keepalive"] else None
+    time.sleep(2.5)
+    mt.ser.reset_input_buffer()
+    return mt
 
 
 def main():
-    threading.Thread(target=_keepalive_thread, daemon=True).start()
+    if CFG["keepalive"]:
+        threading.Thread(target=_keepalive_thread, daemon=True).start()
 
     mt = Minitel(port=PORT)
     with _ka_lock:
-        _ka_ref[0] = mt
+        _ka_ref[0] = mt if CFG["keepalive"] else None
     time.sleep(2.5)
     mt.ser.reset_input_buffer()
 
     wifi_setup(mt)
 
+    # Chat-only kiosk: no menu, just (re)launch the chat client forever.
+    if not CFG["show_menu"]:
+        chat = APP_REGISTRY["chat"](PY, PORT)
+        while True:
+            run_app(mt, chat)
+            mt = _reopen()
+
+    # Full menu.
     while True:
         entries = _menu_entries()
         show_menu(mt, entries)
@@ -321,12 +370,8 @@ def main():
         if kind == "settings":
             settings_menu(mt, SERVICE, wifi_setup)
             continue
-        run_app(mt, idx, payload)
-        mt = Minitel(port=PORT)
-        with _ka_lock:
-            _ka_ref[0] = mt        # re-enable keepalive for the menu period
-        time.sleep(2.5)
-        mt.ser.reset_input_buffer()
+        run_app(mt, payload)
+        mt = _reopen()
 
 
 if __name__ == "__main__":

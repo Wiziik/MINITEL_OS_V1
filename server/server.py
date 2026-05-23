@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import secrets
 import time
 from collections import defaultdict, deque
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import Dict, Set
 
 import aiosqlite
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -19,33 +20,30 @@ log = logging.getLogger("minitelnet")
 _start_time = time.time()
 
 DB_PATH = Path(__file__).parent / "minitelnet.db"
-TOKENS: Dict[str, tuple] = {}
-TOKEN_TTL = 86400
-_login_failures: Dict[str, list] = {}
+# Admin secret guards device enroll/revoke. If unset, those endpoints are disabled.
+ADMIN_SECRET = os.environ.get("MINITELNET_ADMIN_SECRET", "")
+
 _msg_times: Dict[str, deque] = defaultdict(lambda: deque(maxlen=10))
 
 db: aiosqlite.Connection | None = None
 
 
-def _validate_token(token: str) -> str | None:
-    entry = TOKENS.get(token)
-    if not entry:
-        return None
-    username, created_at = entry
-    if time.time() - created_at > TOKEN_TTL:
-        del TOKENS[token]
-        return None
-    return username
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
 # ---------- db helpers ----------
 
 async def _db_init() -> None:
     await db.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            username     TEXT PRIMARY KEY,
-            password_hash TEXT NOT NULL,
-            last_room    TEXT DEFAULT ''
+        CREATE TABLE IF NOT EXISTS devices (
+            device_id    TEXT PRIMARY KEY,
+            token_hash   TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL UNIQUE,
+            last_room    TEXT DEFAULT '',
+            created_at   REAL NOT NULL,
+            last_seen    REAL DEFAULT 0,
+            revoked      INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS messages (
             id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,82 +53,56 @@ async def _db_init() -> None:
             ts       REAL    NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_messages_room_ts ON messages (room, ts);
+        CREATE INDEX IF NOT EXISTS idx_devices_token ON devices (token_hash);
     """)
     await db.commit()
 
 
-async def _migrate_accounts_json() -> None:
-    old = Path(__file__).parent / "accounts.json"
-    if not old.exists():
-        return
-    try:
-        data = json.loads(old.read_text())
-        rows = [(u, v["password_hash"], v.get("last_room", "")) for u, v in data.items()]
-        await db.executemany(
-            "INSERT OR IGNORE INTO users (username, password_hash, last_room) VALUES (?,?,?)",
-            rows,
-        )
-        await db.commit()
-        old.rename(old.with_suffix(".json.bak"))
-        log.info("Migrated %d accounts from accounts.json", len(data))
-    except Exception as e:
-        log.warning("Migration failed: %s", e)
+async def _auth_device(token: str):
+    """Return (device_id, display_name, last_room) for a valid, non-revoked
+    device token, else None. Updates last_seen on success."""
+    if not token:
+        return None
+    async with db.execute(
+        "SELECT device_id, display_name, last_room FROM devices "
+        "WHERE token_hash=? AND revoked=0",
+        (_hash_token(token),),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    await db.execute(
+        "UPDATE devices SET last_seen=? WHERE device_id=?", (time.time(), row[0])
+    )
+    await db.commit()
+    return row[0], row[1], row[2]
 
 
-async def _save_last_room(username: str, room: str) -> None:
-    await db.execute("UPDATE users SET last_room=? WHERE username=?", (room, username))
+async def _save_last_room(device_id: str, room: str) -> None:
+    await db.execute(
+        "UPDATE devices SET last_room=? WHERE device_id=?", (room, device_id)
+    )
     await db.commit()
 
 
 async def _get_history(room: str, before: float, limit: int = 10) -> list:
     async with db.execute(
-        "SELECT username, message, ts FROM messages WHERE room=? AND ts<? ORDER BY ts DESC LIMIT ?",
+        "SELECT username, message, ts FROM messages WHERE room=? AND ts<? "
+        "ORDER BY ts DESC LIMIT ?",
         (room, before, limit),
     ) as cur:
         rows = await cur.fetchall()
     return [{"user": r[0], "message": r[1], "ts": r[2]} for r in reversed(rows)]
 
 
-# ---------- rate limiting ----------
+# ---------- rate limiting (message flood) ----------
 
-def _check_login_rate(username: str) -> None:
+def _check_msg_rate(name: str) -> bool:
     now = time.time()
-    recent = [t for t in _login_failures.get(username, []) if now - t < 30]
-    _login_failures[username] = recent
-    if len(recent) >= 3:
-        raise HTTPException(status_code=429, detail="Trop de tentatives. Attendez 30s.")
-
-
-def _record_login_failure(username: str) -> None:
-    _login_failures.setdefault(username, []).append(time.time())
-
-
-def _clear_login_failures(username: str) -> None:
-    _login_failures.pop(username, None)
-
-
-def _check_msg_rate(username: str) -> bool:
-    now = time.time()
-    times = _msg_times[username]
+    times = _msg_times[name]
     recent = sum(1 for t in times if now - t < 10)
     times.append(now)
     return recent < 5
-
-
-# ---------- passwords ----------
-
-def _hash_pw(password: str) -> str:
-    salt = secrets.token_hex(16)
-    h = hashlib.sha256(f"{salt}{password}".encode()).hexdigest()
-    return f"{salt}:{h}"
-
-
-def _verify_pw(password: str, stored: str) -> bool:
-    try:
-        salt, h = stored.split(":", 1)
-        return hashlib.sha256(f"{salt}{password}".encode()).hexdigest() == h
-    except Exception:
-        return False
 
 
 # ---------- lifespan ----------
@@ -140,16 +112,8 @@ async def lifespan(app: FastAPI):
     global db
     db = await aiosqlite.connect(DB_PATH)
     await _db_init()
-    await _migrate_accounts_json()
-    async def _cleanup_loop():
-        while True:
-            await asyncio.sleep(300)
-            now = time.time()
-            for u in list(_login_failures.keys()):
-                _login_failures[u] = [t for t in _login_failures[u] if now - t < 30]
-                if not _login_failures[u]:
-                    del _login_failures[u]
-    asyncio.create_task(_cleanup_loop())
+    if not ADMIN_SECRET:
+        log.warning("MINITELNET_ADMIN_SECRET unset — enroll/revoke endpoints disabled.")
     yield
     await db.close()
 
@@ -157,64 +121,80 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="MinitelNet Server", lifespan=lifespan)
 
 
-# ---------- auth ----------
+# ---------- admin: device enrollment ----------
 
-class AuthBody(BaseModel):
-    username: str
-    password: str
-
-
-@app.get("/auth/exists/{username}")
-async def auth_exists(username: str):
-    async with db.execute(
-        "SELECT 1 FROM users WHERE username=?", (username.strip().lower(),)
-    ) as cur:
-        row = await cur.fetchone()
-    return {"exists": row is not None}
+def _require_admin(secret: str | None) -> None:
+    if not ADMIN_SECRET:
+        raise HTTPException(status_code=503, detail="Enrollment disabled (no admin secret).")
+    if not secret or not secrets.compare_digest(secret, ADMIN_SECRET):
+        raise HTTPException(status_code=401, detail="Bad admin secret.")
 
 
-@app.post("/auth/login")
-async def auth_login(body: AuthBody):
-    user = body.username.strip().lower()[:20]
-    _check_login_rate(user)
-    async with db.execute(
-        "SELECT password_hash, last_room FROM users WHERE username=?", (user,)
-    ) as cur:
-        row = await cur.fetchone()
-    if row is None:
-        _record_login_failure(user)
-        raise HTTPException(status_code=401, detail="Utilisateur inconnu")
-    if not _verify_pw(body.password, row[0]):
-        _record_login_failure(user)
-        raise HTTPException(status_code=401, detail="Mot de passe incorrect")
-    _clear_login_failures(user)
-    token = secrets.token_hex(32)
-    TOKENS[token] = (user, time.time())
-    return {"ok": True, "token": token, "username": user, "last_room": row[1] or ""}
+def _clean_name(name: str) -> str:
+    return "".join(c for c in str(name).strip()[:20]
+                   if c.isalnum() or c in "-_ ").strip()
 
 
-@app.post("/auth/register")
-async def auth_register(body: AuthBody):
-    user = body.username.strip().lower()[:20]
-    if not user or not all(c.isalnum() or c in "-_" for c in user):
-        raise HTTPException(status_code=400, detail="Nom invalide (lettres, chiffres, - _)")
-    if len(body.password) < 8:
-        raise HTTPException(status_code=400, detail="Mot de passe trop court (min 8)")
+class EnrollBody(BaseModel):
+    display_name: str
+
+
+class RevokeBody(BaseModel):
+    device_id: str
+
+
+@app.post("/admin/enroll")
+async def admin_enroll(body: EnrollBody, x_admin_secret: str | None = Header(default=None)):
+    """Mint a new device. Returns the plaintext token ONCE (only its hash is stored).
+    The enroll tool writes it to the Pi's /etc/minitelnet/device.json."""
+    _require_admin(x_admin_secret)
+    name = _clean_name(body.display_name)
+    if not name:
+        raise HTTPException(status_code=400, detail="Nom invalide (lettres, chiffres, - _).")
+    device_id = "dev_" + secrets.token_hex(4)
+    token = secrets.token_urlsafe(32)
     try:
         await db.execute(
-            "INSERT INTO users (username, password_hash, last_room) VALUES (?,?,?)",
-            (user, _hash_pw(body.password), ""),
+            "INSERT INTO devices (device_id, token_hash, display_name, created_at) "
+            "VALUES (?,?,?,?)",
+            (device_id, _hash_token(token), name, time.time()),
         )
         await db.commit()
     except aiosqlite.IntegrityError:
-        raise HTTPException(status_code=409, detail="Nom deja pris")
-    token = secrets.token_hex(32)
-    TOKENS[token] = (user, time.time())
-    log.info("New account: %s", user)
-    return {"ok": True, "token": token, "username": user, "last_room": ""}
+        raise HTTPException(status_code=409, detail="Nom deja pris.")
+    log.info("Enrolled device %s (%s)", device_id, name)
+    return {"device_id": device_id, "token": token, "display_name": name}
 
 
-# ---------- rooms ----------
+@app.post("/admin/revoke")
+async def admin_revoke(body: RevokeBody, x_admin_secret: str | None = Header(default=None)):
+    _require_admin(x_admin_secret)
+    cur = await db.execute(
+        "UPDATE devices SET revoked=1 WHERE device_id=?", (body.device_id,)
+    )
+    await db.commit()
+    if cur.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Appareil inconnu.")
+    log.info("Revoked device %s", body.device_id)
+    return {"ok": True, "device_id": body.device_id}
+
+
+@app.get("/admin/devices")
+async def admin_devices(x_admin_secret: str | None = Header(default=None)):
+    _require_admin(x_admin_secret)
+    async with db.execute(
+        "SELECT device_id, display_name, last_room, last_seen, revoked "
+        "FROM devices ORDER BY created_at"
+    ) as cur:
+        rows = await cur.fetchall()
+    return [
+        {"device_id": r[0], "display_name": r[1], "last_room": r[2],
+         "last_seen": r[3], "revoked": bool(r[4])}
+        for r in rows
+    ]
+
+
+# ---------- rooms / connections ----------
 
 def _clean_room(name: str) -> str:
     return "".join(c for c in str(name)[:30] if c.isalnum() or c in "-_ ").strip()
@@ -280,13 +260,12 @@ async def get_rooms():
 
 @app.get("/health")
 async def health():
-    async with db.execute("SELECT COUNT(*) FROM users") as cur:
-        user_count = (await cur.fetchone())[0]
+    async with db.execute("SELECT COUNT(*) FROM devices WHERE revoked=0") as cur:
+        device_count = (await cur.fetchone())[0]
     return {
         "status": "ok",
-        "users": user_count,
+        "devices": device_count,
         "rooms": manager.list_rooms(),
-        "active_tokens": len(TOKENS),
         "uptime": round(time.time() - _start_time),
     }
 
@@ -296,22 +275,26 @@ async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     user = ""
     room = "general"
+    device_id = ""
     try:
         raw = await ws.receive_text()
         data = json.loads(raw)
 
-        token = str(data.get("token", ""))
-        user = _validate_token(token)
-        if not user:
-            await ws.send_json({"type": "error", "message": "Non autorise"})
+        device = await _auth_device(str(data.get("token", "")))
+        if not device:
+            await ws.send_json({"type": "error", "message": "Appareil non autorise"})
             await ws.close()
             return
+        device_id, user, last_room = device
 
-        room = _clean_room(data.get("room", "general")) or "general"
+        room = _clean_room(data.get("room", "")) or last_room or "general"
 
         manager.join(ws, room, user)
-        await _save_last_room(user, room)
+        await _save_last_room(device_id, room)
         log.info("[#%s] %s joined (%d)", room, user, len(manager.rooms[room]))
+
+        # Tell the client who it is and where it landed, so it can draw its header.
+        await ws.send_json({"type": "hello", "user": user, "room": room})
 
         recent = await _get_history(room, time.time())
         if recent:
@@ -340,7 +323,7 @@ async def ws_endpoint(ws: WebSocket):
                 old_room = room
                 manager.join(ws, new_room, user)
                 room = new_room
-                await _save_last_room(user, room)
+                await _save_last_room(device_id, room)
                 log.info("%s moved #%s -> #%s", user, old_room, room)
 
                 recent = await _get_history(room, time.time())
