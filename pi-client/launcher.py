@@ -8,28 +8,30 @@ import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 from minitel import Minitel
+from launcher_settings import settings_menu, enabled_addon_apps
 
-PORT  = os.environ.get("MINITEL_PORT", "/dev/ttyUSB0")
-HERE  = os.path.dirname(os.path.abspath(__file__))
-PY    = sys.executable
+PORT    = os.environ.get("MINITEL_PORT", "/dev/ttyUSB0")
+HERE    = os.path.dirname(os.path.abspath(__file__))
+PY      = sys.executable
+SERVICE = "minitelnet-client.service"
 
 APPS = [
     {
-        "label": "1. MinitelNet - Chat",
+        "label": "MinitelNet - Chat",
         "cmd": [PY, os.path.join(HERE, "client.py")],
     },
     {
-        "label": "2. Twitch TV STORE",
+        "label": "Twitch TV STORE",
         "cmd": [PY, "/home/pi/twitch_minitel_v2.py", "--port", PORT],
     },
     {
-        "label": "3. Coeur Poetique",
+        "label": "Coeur Poetique",
         "cmd": [PY, "/home/pi/minitel_heart_search.py",
                 "--port", PORT,
                 "--folder", "/home/pi/texts/poetry_corpus"],
     },
     {
-        "label": "4. Snake",
+        "label": "Snake",
         "cmd": [PY, os.path.join(HERE, "snake.py"), "--port", PORT],
     },
 ]
@@ -228,7 +230,15 @@ def wifi_setup(mt):
 
 # ── main menu ─────────────────────────────────────────────────────────────
 
-def show_menu(mt):
+def _menu_entries():
+    """Recompute each render so newly-enabled addons appear immediately."""
+    entries = [(a["label"], "app", a) for a in APPS]
+    entries += [(a["label"], "app", a) for a in enabled_addon_apps(PY, PORT)]
+    entries.append(("Reglages", "settings", None))
+    return entries
+
+
+def show_menu(mt, entries):
     mt.clear_screen()
     mt.send_line("")
     for row in _big_text("3615"):
@@ -239,27 +249,26 @@ def show_menu(mt):
     mt.send_line("")
     mt.send_line("----------------------------------------")
     mt.send_line("")
-    for app in APPS:
-        mt.send_line(f"  {app['label']}")
+    for i, (label, _kind, _p) in enumerate(entries, 1):
+        mt.send_line(f"  {i}. {label}")
     mt.send_line("")
-    mt.send_line(f"  Tapez 1-{len(APPS)} puis ENVOI:")
+    mt.send_line(f"  Tapez 1-{len(entries)} puis ENVOI:")
     mt.send_text("  > ")
 
 
-def pick(mt):
-    valid = {str(i + 1) for i in range(len(APPS))}
+def pick(mt, entries):
+    valid = {str(i + 1) for i in range(len(entries))}
     while True:
         raw = mt.read_input().strip()
         if raw in valid:
             return int(raw) - 1
         if raw == "/clear":
-            show_menu(mt)
+            show_menu(mt, entries)
         else:
             mt.send_text("  > ")
 
 
-def run_app(mt, idx):
-    app = APPS[idx]
+def run_app(mt, idx, app):
     mt.clear_screen()
     mt.send_line(f"  Lancement: {app['label']}")
     mt.send_line("")
@@ -305,9 +314,14 @@ def main():
     wifi_setup(mt)
 
     while True:
-        show_menu(mt)
-        idx = pick(mt)
-        run_app(mt, idx)
+        entries = _menu_entries()
+        show_menu(mt, entries)
+        idx = pick(mt, entries)
+        label, kind, payload = entries[idx]
+        if kind == "settings":
+            settings_menu(mt, SERVICE, wifi_setup)
+            continue
+        run_app(mt, idx, payload)
         mt = Minitel(port=PORT)
         with _ka_lock:
             _ka_ref[0] = mt        # re-enable keepalive for the menu period
